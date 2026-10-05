@@ -1,0 +1,5 @@
+*.elf
+__pycache__/
+.DS_Store
+tests/run_tests
+tests/t/

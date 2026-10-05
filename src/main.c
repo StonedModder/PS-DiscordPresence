@@ -3,7 +3,6 @@
 #include "psdp_notify.h"
 
 #include <arpa/inet.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -22,7 +21,6 @@
 static struct presence_config cfg;
 static struct presence_snapshot last;
 extern int sceKernelGetProsperoSystemSwVersion(void *);
-extern int dynlib_get_obj_member(uint32_t module_id, size_t member_index, void **out);
 
 static int send_all(int fd, const void *buf, size_t len) {
     const char *p = buf;
@@ -32,30 +30,28 @@ static int send_all(int fd, const void *buf, size_t len) {
 
 static void reply(int fd, int status, const char *type, const char *body) {
     char header[256];
-    int n = snprintf(header, sizeof(header), "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", status, status == 200 ? "OK" : "Bad Request", type, strlen(body));
+    int n = snprintf(header, sizeof(header), "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", status, status == 200 ? "OK" : status == 404 ? "Not Found" : "Bad Request", type, strlen(body));
     (void)send_all(fd, header, (size_t)n); (void)send_all(fd, body, strlen(body));
 }
 
-static uint32_t firmware_version(void) {
-    
-    void *sce_proc_param = NULL;
-    if (dynlib_get_obj_member(2, 8, &sce_proc_param) == 0 && sce_proc_param) {
-        uint32_t firmware = ((const uint32_t *)sce_proc_param)[5];
-        if (firmware) return firmware;
-    }
-    uint32_t firmware = kernel_get_fw_version();
-    if (firmware) return firmware;
-    typedef int (*system_version_fn)(void *);
-    void *module = dlopen("libkernel.sprx", RTLD_NOW);
-    system_version_fn get_version = module ? (system_version_fn)dlsym(module, "sceKernelGetProsperoSystemSwVersion") : NULL;
-    uint8_t info[0x18] = {0};
-    *(uint32_t *)info = sizeof(info);
-    int rc = get_version ? get_version(info) : sceKernelGetProsperoSystemSwVersion(info);
-    if (rc == 0) firmware = *(uint32_t *)(info + 0x14);
-    if (module) dlclose(module);
-    return firmware;
-}
+typedef struct {
+    uint64_t size;
+    char str_version[0x1c];
+    uint32_t bin_version;
+    uint64_t reserved;
+} sce_sw_version_t;
 
+/* Live system software version, e.g. 0x09600000 for 9.60. The proc-param SDK
+   version (kernel_get_fw_version) is what libkernel was built against and can
+   lag the installed firmware, so it is only a fallback. */
+static uint32_t firmware_version(void) {
+    static uint32_t cached;
+    if (cached) return cached;
+    sce_sw_version_t v; memset(&v, 0, sizeof(v)); v.size = sizeof(v);
+    if (sceKernelGetProsperoSystemSwVersion(&v) == 0 && v.bin_version) cached = v.bin_version;
+    else cached = kernel_get_fw_version();
+    return cached;
+}
 
 static int bounded_state_query(struct fg_state_response *out, unsigned timeout_seconds) {
     int pipefd[2];
@@ -118,18 +114,21 @@ static void client(int fd) {
     if (!strcmp(line, "GET /api/status HTTP/1.1")) {
         struct fg_state_response state;
         struct presence_metadata meta;
-        char output[1024];
+        char output[2048], title[400], reason[340];
         uint32_t firmware = firmware_version();
-        char firmware_text[16];
-        snprintf(firmware_text, sizeof(firmware_text), "%02x.%02x", (firmware >> 24) & 0xff, (firmware >> 16) & 0xff);
+        char firmware_text[16] = "";
+        if (firmware) snprintf(firmware_text, sizeof(firmware_text), "%x.%02x", (firmware >> 24) & 0xff, (firmware >> 16) & 0xff);
         int query_rc = bounded_state_query(&state, 3);
         if (query_rc != 0) {
             snprintf(output, sizeof(output), "{\"state\":\"probe_timeout\",\"probe_rc\":%d,\"firmware\":\"%s\",\"reason\":\"game-state probe exceeded 3 seconds; retry after ShellUI settles\"}\n", query_rc, firmware_text);
             reply(fd, 200, "application/json", output); return;
         }
+        presence_stabilize(&last, &state);
         presence_reduce(&last, &state, &last);
         presence_metadata_resolve(state.titleid, &meta);
-        snprintf(output, sizeof(output), "{\"state\":\"%s\",\"confidence\":%u,\"firmware\":\"%s\",\"titleid\":\"%s\",\"titleName\":\"%s\",\"iconUrl\":\"/api/icon?titleid=%s\",\"contentid\":\"%s\",\"reason\":\"%s\"}\n", presence_class_name(state.classification), state.confidence, firmware_text, cfg.show_title_id ? state.titleid : "", meta.title_name, meta.icon_path[0] ? state.titleid : "", cfg.show_content_id ? state.contentid : "", state.reason);
+        presence_json_escape(meta.title_name, title, sizeof(title));
+        presence_json_escape(state.reason, reason, sizeof(reason));
+        snprintf(output, sizeof(output), "{\"state\":\"%s\",\"confidence\":%u,\"firmware\":\"%s\",\"titleid\":\"%s\",\"titleName\":\"%s\",\"iconUrl\":\"/api/icon?titleid=%s\",\"contentid\":\"%s\",\"reason\":\"%s\"}\n", presence_class_name(state.classification), state.confidence, firmware_text, cfg.show_title_id ? state.titleid : "", title, meta.icon_path[0] ? state.titleid : "", cfg.show_content_id ? state.contentid : "", reason);
         reply(fd, 200, "application/json", output); return;
     }
     if (!strcmp(line, "GET /api/config HTTP/1.1")) {
